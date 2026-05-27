@@ -1,0 +1,63 @@
+name: Docker Multi-Architecture Build (Experimental)
+
+# Builds the experimental piped-proxy image, pushed to `:experimental` so
+# the production `:latest` served by the main branch stays untouched.
+# Mirrors docker-build.yml otherwise.
+
+on:
+    push:
+        paths-ignore:
+            - "**.md"
+        branches:
+            - experimental
+    workflow_dispatch:
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      runner: ubuntu-latest
+                    - arch: arm64
+                      runner: ubuntu-24.04-arm
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - uses: actions/checkout@v6
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v4
+              with:
+                  version: latest
+            - name: Login to DockerHub
+              uses: docker/login-action@v4
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_PASSWORD }}
+            - name: Build and push per-arch experimental image
+              uses: docker/build-push-action@v7
+              with:
+                  context: .
+                  file: ./Dockerfile
+                  platforms: linux/${{ matrix.arch }}
+                  push: true
+                  tags: logicalkarma/piped-proxy:experimental-${{ matrix.arch }}
+                  cache-from: type=gha,scope=experimental-${{ matrix.arch }}
+                  cache-to: type=gha,mode=max,scope=experimental-${{ matrix.arch }}
+
+    manifest:
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v4
+            - name: Login to DockerHub
+              uses: docker/login-action@v4
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_PASSWORD }}
+            - name: Create and push multi-arch experimental manifest
+              run: |
+                  docker buildx imagetools create -t logicalkarma/piped-proxy:experimental \
+                      logicalkarma/piped-proxy:experimental-amd64 \
+                      logicalkarma/piped-proxy:experimental-arm64
