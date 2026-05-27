@@ -278,21 +278,25 @@ fn apply_range_headers(response: &mut HttpResponseBuilder, range_request: &Range
     response.insert_header(("Content-Length", actual_length.to_string()));
 }
 
-async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
+async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<dyn Error>> {
+    // parse query string up-front so we can detect SABR (which uses POST + a
+    // protobuf body, unlike the existing GET-only proxy paths).
+    let mut query = QString::from(req.query_string());
+
+    let is_sabr_request = req.path().eq("/videoplayback") && query.get("sabr").is_some();
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let mut response = HttpResponse::Ok();
         add_headers(&mut response);
         return Ok(response.finish());
     } else if req.method() != actix_web::http::Method::GET
         && req.method() != actix_web::http::Method::HEAD
+        && !(is_sabr_request && req.method() == actix_web::http::Method::POST)
     {
         let mut response = HttpResponse::MethodNotAllowed();
         add_headers(&mut response);
         return Ok(response.finish());
     }
-
-    // parse query string
-    let mut query = QString::from(req.query_string());
 
     #[cfg(feature = "qhash")]
     {
@@ -315,7 +319,10 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
             {
                 let pairs = query.to_pairs();
                 for (key, value) in &pairs {
-                    if matches!(*key, "qhash" | "range" | "rewrite") {
+                    // `rn` is mutated by LuanRT's SabrStreamingAdapter on every
+                    // request (a per-request sequence number); excluding it lets
+                    // the same SABR session URL be reused across requests.
+                    if matches!(*key, "qhash" | "range" | "rewrite" | "rn") {
                         continue;
                     }
                     set.insert((key.as_bytes().to_owned(), value.as_bytes().to_owned()));
@@ -451,7 +458,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     url.set_query(Some(qs.to_string().as_str()));
 
     let method = {
-        if is_web && video_playback {
+        if (is_web && video_playback) || is_sabr_request {
             Method::POST
         } else {
             Method::from_str(req.method().as_str())?
@@ -462,6 +469,11 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
     if is_web && video_playback {
         request.body_mut().replace(Body::from("x\0"));
+    } else if is_sabr_request {
+        // Forward the VideoPlaybackAbrRequest protobuf body verbatim. The
+        // frontend (LuanRT googlevideo adapter) constructs it and the
+        // upstream googlevideo SABR endpoint reads it directly.
+        request.body_mut().replace(Body::from(body.clone()));
     }
 
     let request_headers = request.headers_mut();
@@ -622,7 +634,12 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
         response.no_chunking(content_length.to_str().unwrap().parse::<u64>().unwrap());
     }
 
-    if is_ump && resp.status().is_success() {
+    // The existing UMP-transform path strips framing and emits raw media bytes
+    // for clients that expect a plain stream. SABR requests are excluded from
+    // it because LuanRT (frontend) parses UMP itself — for SABR we pass the
+    // response body through unchanged. The default streaming branch further
+    // down handles that case.
+    if is_ump && !is_sabr_request && resp.status().is_success() {
         if let Some(mime_type) = mime_type {
             response.content_type(mime_type);
         }
